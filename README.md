@@ -100,6 +100,10 @@ codex plugin add codex_kuangdeng_zcode_innight@aces-zcode
 
 该文件不进入 Git 或插件 ZIP。夜间活动只按当期[智谱官方规则](https://docs.bigmodel.cn/cn/coding-plan/notice/event-glm-5.3-flash)判断；活动过期不等于不能按正常套餐使用。UI 百分比、token 统计和本地 `cost=0` 都不是逐请求零扣额凭证。
 
+## 下载插件包
+
+[下载 v0.1.0 插件 ZIP](packages/codex_kuangdeng_zcode_innight-0.1.0.zip)（打开文件页后选择 Download raw file）。ZIP 只含源码、文档及上游源码归档，Linux 运行时仍需在目标机器构建。
+
 ## 验证、源码与打包
 
 ```bash
