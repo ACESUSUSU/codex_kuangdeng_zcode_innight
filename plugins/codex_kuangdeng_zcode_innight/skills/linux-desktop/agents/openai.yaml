@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linux 桌面控制"
+  short_description: "在 Ubuntu 22.04 上通过 MCP 操作可见窗口、截图、键盘和鼠标"
+  default_prompt: "使用 $linux-desktop，观察当前桌面应用，再执行并核对我要求的操作。"

@@ -1,0 +1,20 @@
+{
+  "name": "aces-zcode",
+  "interface": {
+    "displayName": "Aces Zcode"
+  },
+  "plugins": [
+    {
+      "name": "codex_kuangdeng_zcode_innight",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex_kuangdeng_zcode_innight"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

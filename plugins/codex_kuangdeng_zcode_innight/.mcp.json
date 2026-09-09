@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "computer_use_linux": {
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/skills/linux-desktop/scripts/start-desktop.sh"],
+      "env_vars": ["DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DBUS_SESSION_BUS_ADDRESS", "LANG", "LC_ALL", "XDG_DATA_HOME", "ZCODE_DESKTOP_HOME"],
+      "startup_timeout_sec": 60,
+      "tool_timeout_sec": 60
+    }
+  }
+}

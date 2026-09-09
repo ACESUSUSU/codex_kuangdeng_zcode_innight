@@ -1,0 +1,443 @@
+--- a/src/atspi_tree.rs
++++ b/src/atspi_tree.rs
+@@ -403,7 +403,7 @@
+         .action()
+         .await
+         .context("element does not expose the AT-SPI Action interface")?;
+-    let actions = action.get_actions().await.unwrap_or_default();
++    let actions = read_actions(&action).await;
+     let action_index = select_action_index(&actions, requested_action)?;
+     let action_name = actions
+         .get(action_index as usize)
+@@ -719,10 +719,8 @@
+         return Vec::new();
+     };
+ 
+-    action_proxy
+-        .get_actions()
++    read_actions(&action_proxy)
+         .await
+-        .unwrap_or_default()
+         .into_iter()
+         .enumerate()
+         .map(|(index, action)| AccessibilityAction {
+@@ -734,6 +732,21 @@
+         .collect()
+ }
+ 
++async fn read_actions(action: &atspi::proxy::action::ActionProxy<'_>) -> Vec<atspi::Action> {
++    // Ubuntu 22.04's ATK bridge can abort the target app while serializing GetActions.
++    // Read the same fields individually instead.
++    let mut actions = Vec::new();
++    // zbus derives "Nactions" from nactions(); the AT-SPI property is "NActions".
++    for index in 0..action.inner().get_property::<i32>("NActions").await.unwrap_or(0) {
++        actions.push(atspi::Action {
++            name: action.get_name(index).await.unwrap_or_default(),
++            description: action.get_description(index).await.unwrap_or_default(),
++            keybinding: action.get_key_binding(index).await.unwrap_or_default(),
++        });
++    }
++    actions
++}
++
+ async fn states_from_proxy(proxy: &AccessibleProxy<'_>) -> Vec<String> {
+     proxy
+         .get_state()
+--- a/src/screenshot.rs
++++ b/src/screenshot.rs
+@@ -384,7 +384,7 @@
+     // foreground window required. `tokio::process::Command` searches PATH and
+     // provides an async, non-polling wait.
+     let mut child = match Command::new("gnome-screenshot")
+-        .args(["-f", filename])
++        .args(["--include-pointer", "-f", filename])
+         .stdin(Stdio::null())
+         .stdout(Stdio::null())
+         .stderr(Stdio::null())
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -43,6 +43,7 @@
+     time::Duration,
+ };
+ use tokio::{
++    io::AsyncWriteExt,
+     process::Command as TokioCommand,
+     time::{sleep, timeout},
+ };
+@@ -76,6 +77,12 @@
+     /// Cached physical desktop size from the most recent full-frame capture;
+     /// used for off-screen warnings and portal logical-coordinate mapping.
+     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
++    pointer_feedback: Arc<tokio::sync::Mutex<Option<PointerFeedback>>>,
++}
++
++struct PointerFeedback {
++    _child: tokio::process::Child,
++    input: tokio::process::ChildStdin,
+ }
+ 
+ fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
+@@ -105,6 +112,38 @@
+ }
+ 
+ impl ComputerUseLinux {
++    async fn show_pointer_feedback(&self, action: &str) {
++        if !self.should_prefer_xdotool_pointer() {
++            return;
++        }
++        let mut feedback = self.pointer_feedback.lock().await;
++        if feedback.is_none() {
++            let spawned = TokioCommand::new("/usr/bin/python3")
++                .args(["-u", "-c", include_str!("pointer_feedback.py")])
++                .env("NO_AT_BRIDGE", "1")
++                .stdin(Stdio::piped())
++                .stdout(Stdio::null())
++                .stderr(Stdio::inherit())
++                .kill_on_drop(true)
++                .spawn();
++            match spawned {
++                Ok(mut child) => {
++                    if let Some(input) = child.stdin.take() {
++                        *feedback = Some(PointerFeedback { _child: child, input });
++                    }
++                }
++                Err(error) => eprintln!("Pointer feedback unavailable: {error}"),
++            }
++        }
++        if let Some(process) = feedback.as_mut() {
++            let message = format!("{}\n", serde_json::json!({ "action": action }));
++            if let Err(error) = process.input.write_all(message.as_bytes()).await {
++                eprintln!("Pointer feedback unavailable: {error}");
++                *feedback = None;
++            }
++        }
++    }
++
+     fn mcp_tool_router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+         let mut router = Self::tool_router();
+         if !shell_execution_enabled() {
+@@ -749,6 +788,7 @@
+         let ClickTarget::Coordinates(x, y) = target else {
+             unreachable!("click target must resolve to coordinates or an AT-SPI action");
+         };
++        self.show_pointer_feedback("click").await;
+         let button = mouse_button_code(params.button.as_deref());
+         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
+         // Preferred backend: the uinput absolute pointer. Unlike ydotool's
+@@ -920,6 +960,40 @@
+     }
+ 
+     #[tool(
++        name = "hover",
++        description = "Move the visible pointer to a desktop coordinate or cached element without clicking. X11 only. A target window is focused first when window_id is supplied.",
++        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
++    )]
++    async fn hover(&self, Parameters(params): Parameters<HoverParams>) -> Json<ActionOutput> {
++        let received = Some(serde_json::json!(params));
++        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
++        if let Some(window_id) = params.window_id {
++            let target = WindowTarget { window_id: Some(window_id), ..Default::default() };
++            if let Err(message) = self.focus_target_for_input(&target).await {
++                return Json(ActionOutput { ok: false, implemented: true, action: "hover".into(), message, received });
++            }
++        }
++        let point = self.resolve_optional_target_point(params.x, params.y, params.element_index);
++        let (x, y) = match point {
++            Ok(Some(point)) => point,
++            other => return Json(ActionOutput {
++                ok: false, implemented: true, action: "hover".into(),
++                message: other.err().unwrap_or_else(|| "Provide x/y or element_index.".into()), received,
++            }),
++        };
++        if !self.should_prefer_xdotool_pointer() {
++            return Json(ActionOutput { ok: false, implemented: false, action: "hover".into(), message: "Hover currently requires X11 and xdotool.".into(), received });
++        }
++        self.show_pointer_feedback("hover").await;
++        let args = vec!["mousemove".into(), "--".into(), x.to_string(), y.to_string(), "sleep".into(), "0.25".into()];
++        let (input_guard, result) = run_cancellation_safe_input(input_guard, async move { run_x11_input(&args).await }).await;
++        let _input_guard = input_guard;
++        let mut output = action_result("hover", result.map(|output| vec![output]), received);
++        if output.ok { output.message = "Pointer moved through xdotool (X11 XTEST).".into(); }
++        Json(output)
++    }
++
++    #[tool(
+         name = "perform_action",
+         description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector. Defaults to the primary action unless action is provided.",
+         annotations(
+@@ -1154,6 +1228,20 @@
+             Some((x, y)) => self.off_screen_note_for_point(x, y).await,
+             None => None,
+         };
++        if self.should_prefer_xdotool_pointer() {
++            self.show_pointer_feedback("scroll").await;
++            let button = match direction { ScrollDirection::Up => "4", ScrollDirection::Down => "5", ScrollDirection::Left => "6", ScrollDirection::Right => "7" };
++            let mut args = Vec::new();
++            if let Some((x, y)) = target_point {
++                args.extend(["mousemove".into(), "--".into(), x.to_string(), y.to_string()]);
++            }
++            args.extend(["click".into(), "--repeat".into(), units.to_string(), "--delay".into(), "35".into(), button.into()]);
++            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move { run_x11_input(&args).await }).await;
++            let _input_guard = input_guard;
++            let mut output = action_result("scroll", result.map(|output| vec![output]), received);
++            if output.ok { output.message = "Scroll sent through xdotool (X11 XTEST).".into(); }
++            return Json(with_notes(output, off_screen_note));
++        }
+         if let Some(session) = self.cached_portal_pointer_session() {
+             let mapped_target = match (portal_target_point, target_point) {
+                 (Some(point), _) => Some(Some(point)),
+@@ -1275,6 +1363,33 @@
+     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+         let received = Some(serde_json::json!(params));
+         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
++        if let Some(window_id) = params.window_id {
++            let target = WindowTarget { window_id: Some(window_id), ..Default::default() };
++            if let Err(message) = self.focus_target_for_input(&target).await {
++                return Json(ActionOutput { ok: false, implemented: true, action: "drag".into(), message, received });
++            }
++        }
++        if self.should_prefer_xdotool_pointer() {
++            self.show_pointer_feedback("drag").await;
++            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
++                let mut args = vec!["mousemove".into(), "--".into(), params.start_x.to_string(), params.start_y.to_string(), "mousedown".into(), "1".into(), "sleep".into(), "0.08".into()];
++                for step in 1..=20 {
++                    let x = i64::from(params.start_x) + (i64::from(params.end_x) - i64::from(params.start_x)) * step / 20;
++                    let y = i64::from(params.start_y) + (i64::from(params.end_y) - i64::from(params.start_y)) * step / 20;
++                    args.extend(["mousemove".into(), "--".into(), x.to_string(), y.to_string(), "sleep".into(), "0.02".into()]);
++                }
++                args.extend(["mouseup".into(), "1".into()]);
++                let result = run_x11_input(&args).await;
++                if result.is_err() {
++                    let _ = run_x11_input(&["mouseup".into(), "1".into()]).await;
++                }
++                result
++            }).await;
++            let _input_guard = input_guard;
++            let mut output = action_result("drag", result.map(|output| vec![output]), received);
++            if output.ok { output.message = "Drag sent through xdotool (X11 XTEST).".into(); }
++            return Json(output);
++        }
+         // Preferred backend: the uinput absolute pointer (accurate landing).
+         if self.ensure_abs_pointer().await {
+             let abs_pointer = Arc::clone(&self.abs_pointer);
+@@ -2514,11 +2629,25 @@
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
++struct HoverParams {
++    #[serde(default)]
++    window_id: Option<u64>,
++    #[serde(default)]
++    element_index: Option<u32>,
++    #[serde(default)]
++    x: Option<i32>,
++    #[serde(default)]
++    y: Option<i32>,
++}
++
++#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+ struct DragParams {
+     start_x: i32,
+     start_y: i32,
+     end_x: i32,
+     end_y: i32,
++    #[serde(default)]
++    window_id: Option<u64>,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+@@ -4791,6 +4920,12 @@
+ }
+ 
+ async fn run_xdotool(program: &Path, args: &[String]) -> XdotoolAttempt {
++    let command_timeout = if args.first().is_some_and(|arg| arg == "type") {
++        INPUT_COMMAND_TIMEOUT
++            + Duration::from_millis(50 * args.last().map_or(0, |text| text.chars().count()) as u64)
++    } else {
++        INPUT_COMMAND_TIMEOUT
++    };
+     let mut command = TokioCommand::new(program);
+     command.args(args);
+     command.stdout(Stdio::piped());
+@@ -4800,7 +4935,7 @@
+ 
+     match command.spawn() {
+         Ok(child) => XdotoolAttempt::Finished(
+-            match crate::command_runner::output_child(child, "run xdotool", INPUT_COMMAND_TIMEOUT)
++            match crate::command_runner::output_child(child, "run xdotool", command_timeout)
+                 .await
+                 .map_err(|error| format!("{error:#}"))
+             {
+@@ -4813,6 +4948,13 @@
+     }
+ }
+ 
++async fn run_x11_input(args: &[String]) -> std::result::Result<Output, String> {
++    match run_xdotool(Path::new("xdotool"), args).await {
++        XdotoolAttempt::Finished(result) => result,
++        XdotoolAttempt::Unavailable => Err("xdotool is unavailable.".into()),
++    }
++}
++
+ async fn run_xdotool_or_fallback<F, Fut>(
+     program: &Path,
+     args: &[String],
+@@ -4897,11 +5039,13 @@
+ }
+ 
+ fn xdotool_type_args(text: &str) -> Vec<String> {
++    // Give X11 clients time to process temporary Unicode key mappings.
++    let delay = if text.is_ascii() { "0" } else { "50" };
+     vec![
+         "type".to_string(),
+         "--clearmodifiers".to_string(),
+         "--delay".to_string(),
+-        "0".to_string(),
++        delay.to_string(),
+         "--".to_string(),
+         text.to_string(),
+     ]
+--- a/src/windowing/backends/x11.rs
++++ b/src/windowing/backends/x11.rs
+@@ -123,10 +123,36 @@
+     let active_id =
+         resolve_active_window_query(active_window_query_async().await, require_focus_query)?;
+     let mut windows = parse_wmctrl_windows(&String::from_utf8_lossy(&output.stdout), active_id);
++    // Ubuntu's wmctrl/libxdo add the reparenting offset twice. xwininfo reports
++    // actual root-relative client coordinates, matching screenshot pixels.
++    if command_on_path("xwininfo") {
++        for window in &mut windows {
++            if let Some(bounds) = client_bounds(window.window_id).await {
++                window.bounds = Some(bounds);
++            }
++        }
++    }
+     enrich_terminal_windows(&mut windows);
+     Ok(windows)
+ }
+ 
++async fn client_bounds(window_id: u64) -> Option<WindowBounds> {
++    let mut command = TokioCommand::new("xwininfo");
++    command.args(["-id", &window_id.to_string(), "-stats"]).env("LC_ALL", "C");
++    let output = command_runner::output(command, "query X11 client bounds").await.ok()?;
++    if !output.status.success() { return None; }
++    let text = String::from_utf8_lossy(&output.stdout);
++    let field = |label: &str| -> Option<i32> {
++        text.lines().find_map(|line| line.trim().strip_prefix(label)?.trim().parse().ok())
++    };
++    Some(WindowBounds {
++        x: Some(field("Absolute upper-left X:")?),
++        y: Some(field("Absolute upper-left Y:")?),
++        width: u32::try_from(field("Width:")?).ok()?,
++        height: u32::try_from(field("Height:")?).ok()?,
++    })
++}
++
+ pub async fn activate_window(window_id: u64) -> Result<()> {
+     let id = window_id_arg(window_id);
+     run_wmctrl(&["-i", "-a", id.as_str()], "activate window", window_id).await
+@@ -230,6 +256,9 @@
+ }
+ 
+ async fn query_window_bounds(window_id: u64) -> Option<WindowBounds> {
++    if let Some(bounds) = client_bounds(window_id).await {
++        return Some(bounds);
++    }
+     let mut command = wmctrl_async();
+     command.args(["-l", "-p", "-G", "-x"]);
+     let output = command_runner::output(command, "query X11 window geometry")
+--- /dev/null
++++ b/src/pointer_feedback.py
+@@ -0,0 +1,92 @@
++import json
++import math
++import sys
++import time
++
++import cairo
++import gi
++
++gi.require_version("Gtk", "3.0")
++gi.require_version("Gdk", "3.0")
++from gi.repository import Gdk, GLib, Gtk
++
++
++class PointerFeedback(Gtk.Window):
++    def __init__(self):
++        super().__init__(type=Gtk.WindowType.POPUP)
++        self.set_title("Codex pointer feedback")
++        self.set_default_size(80, 80)
++        self.set_app_paintable(True)
++        self.set_accept_focus(False)
++        self.set_focus_on_map(False)
++        self.set_keep_above(True)
++        self.set_skip_taskbar_hint(True)
++        self.set_skip_pager_hint(True)
++        self.set_visual(self.get_screen().get_rgba_visual())
++        self.input_shape_combine_region(cairo.Region())
++        self.connect("draw", self.draw_pointer)
++        self.connect("realize", self.make_pass_through)
++        self.pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
++        self.until = 0
++        self.started = 0
++        self.action = "hover"
++        GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, self.receive)
++        GLib.timeout_add(30, self.tick)
++
++    def make_pass_through(self, widget):
++        surface = widget.get_window()
++        surface.set_pass_through(True)
++        surface.input_shape_combine_region(cairo.Region(), 0, 0)
++
++    def receive(self, stream, condition):
++        if condition & GLib.IO_HUP:
++            Gtk.main_quit()
++            return False
++        line = stream.readline()
++        if not line:
++            Gtk.main_quit()
++            return False
++        self.action = json.loads(line)["action"]
++        self.started = time.monotonic()
++        self.until = self.started + 3.0
++        return True
++
++    def tick(self):
++        if time.monotonic() >= self.until:
++            self.hide()
++            return True
++        _, x, y = self.pointer.get_position()
++        self.move(x - 40, y - 40)
++        self.show_all()
++        self.queue_draw()
++        return True
++
++    def draw_pointer(self, widget, context):
++        context.set_operator(cairo.OPERATOR_SOURCE)
++        context.set_source_rgba(0, 0, 0, 0)
++        context.paint()
++        context.set_operator(cairo.OPERATOR_OVER)
++        age = time.monotonic() - self.started
++        radius = 20 + (6 * abs(math.sin(age * 5)) if self.action == "click" else 0)
++        context.set_source_rgba(0.05, 0.8, 0.78, 0.95)
++        context.set_line_width(3)
++        context.arc(40, 40, radius, 0, math.tau)
++        context.stroke()
++        context.move_to(40, 40)
++        context.line_to(40, 57)
++        context.line_to(45, 52)
++        context.line_to(51, 61)
++        context.line_to(55, 59)
++        context.line_to(49, 50)
++        context.line_to(56, 49)
++        context.close_path()
++        context.set_source_rgba(0.05, 0.8, 0.78, 1)
++        context.fill_preserve()
++        context.set_line_width(1.5)
++        context.set_source_rgba(1, 1, 1, 1)
++        context.stroke()
++        return False
++
++
++PointerFeedback()
++Gtk.main()

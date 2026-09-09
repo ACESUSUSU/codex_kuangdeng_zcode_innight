@@ -1,0 +1,4 @@
+interface:
+  display_name: "codex_kuangdeng_zcode_innight"
+  short_description: "通过 Ubuntu 或 Mac 的 ZCode 桌面派发、等待、审阅并持续协作"
+  default_prompt: "使用 $codex_kuangdeng_zcode_innight，在可见 ZCode 对话中执行任务，并依据实际结果持续审阅推进。"

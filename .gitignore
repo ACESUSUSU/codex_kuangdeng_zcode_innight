@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+preferences.json
+dist/
+.DS_Store
+.env
+.env.*
+node_modules/
+target/
+.venv/
+work/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

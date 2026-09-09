@@ -1,0 +1,38 @@
+{
+  "name": "codex_kuangdeng_zcode_innight",
+  "version": "0.1.0",
+  "description": "Visible ZCode collaboration and Ubuntu 22.04 desktop control for Codex.",
+  "author": {
+    "name": "ACESUSUSU",
+    "url": "https://github.com/ACESUSUSU"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "codex_kuangdeng_zcode_innight",
+    "shortDescription": "可见桌面派发、逐轮审阅与持续协作",
+    "longDescription": "通过官方 ZCode 桌面开展持续协作，包含 Ubuntu 22.04/X11 桌面 MCP 的源码补丁、安装流程和逐轮证据读取工具。",
+    "developerName": "ACESUSUSU",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "检查 Ubuntu 桌面控制环境并读取 ZCode 窗口。",
+      "在可见 ZCode 对话中派发任务，审阅后持续推进。"
+    ],
+    "websiteURL": "https://github.com/ACESUSUSU/codex_kuangdeng_zcode_innight"
+  },
+  "mcpServers": "./.mcp.json",
+  "license": "MIT",
+  "keywords": [
+    "zcode",
+    "ubuntu",
+    "linux",
+    "desktop",
+    "collaboration"
+  ],
+  "homepage": "https://github.com/ACESUSUSU/codex_kuangdeng_zcode_innight",
+  "repository": "https://github.com/ACESUSUSU/codex_kuangdeng_zcode_innight"
+}
